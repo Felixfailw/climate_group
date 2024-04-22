@@ -1,9 +1,16 @@
 """This platform allows several climate devices to be grouped into one climate device."""
 from __future__ import annotations
+
 import logging
 from statistics import mean
 from typing import Any
+from datetime import datetime, timezone, timedelta
+import time
+import math
+import asyncio
+
 import voluptuous as vol
+
 from homeassistant.components.climate import (
     ATTR_CURRENT_TEMPERATURE,
     ATTR_FAN_MODE,
@@ -182,9 +189,15 @@ class ClimateGroup(GroupEntity, ClimateEntity):
 
         self._attr_preset_modes = None
         self._attr_preset_mode = None
-        
-        self.decimal_accuracy_to_half = decimal_accuracy_to_half
 
+        self.decimal_accuracy_to_half = decimal_accuracy_to_half
+        self.last_changed = None
+        self.set_last_changed()
+        self._debounce_timer = None
+        self._DEBOUNCE_SECONDS = 2
+
+    def set_last_changed(self):
+        self.last_changed = datetime.now(timezone.utc)
 
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
@@ -205,6 +218,16 @@ class ClimateGroup(GroupEntity, ClimateEntity):
 
     @callback
     def async_update_group_state(self) -> None:
+        """Debounced Update der Gruppenzustände."""
+        # Wenn bereits ein Timer läuft, cancel diesen
+        if self._debounce_timer:
+            self._debounce_timer.cancel()
+
+        # Setze einen neuen Timer
+        self._debounce_timer = self.hass.loop.call_later(self._DEBOUNCE_SECONDS, self._async_perform_update)
+
+
+    def _async_perform_update(self) -> None:
         """Query all members and determine the climate group state."""
         self._attr_assumed_state = False
 
@@ -222,9 +245,35 @@ class ClimateGroup(GroupEntity, ClimateEntity):
         self._attr_available = any(state.state != STATE_UNAVAILABLE for state in states)
 
         # Temperature settings
-        self._attr_target_temperature = reduce_attribute(
-            states, ATTR_TEMPERATURE, reduce=lambda *data: mean(data)
-        )        
+
+        #HABE ICH EINGEBAUT
+        # Initialisiere eine Variable, um die zuletzt geänderte Entität und deren Zeitpunkt zu speichern
+        last_changed_entity = None
+        last_updated_time = datetime.min.replace(tzinfo=timezone.utc)
+
+        # Find last changed entity
+        for state in filtered_states:
+            # Überspringe Entitäten ohne 'last_changed' Attribut
+            if not hasattr(state, 'last_updated'):
+                continue
+
+            # Vergleiche den Zeitpunkt der letzten Änderung
+            _LOGGER.debug(f"ChangeTime: {state.last_updated}")
+            if state.last_updated > last_updated_time:
+                last_updated_time = state.last_updated
+                last_updated_entity = state
+        _LOGGER.debug(f"LastUpdate: {state.entity_id}")
+
+        if last_updated_entity is not None and 'temperature' in last_updated_entity.attributes:
+            self._attr_target_temperature = reduce_attribute(
+                [last_updated_entity], ATTR_TEMPERATURE, reduce=lambda *data: mean(data)
+            )
+
+        else:
+            self._attr_target_temperature = reduce_attribute(
+                states, ATTR_TEMPERATURE, reduce=lambda *data: mean(data)
+            )
+
         if self.decimal_accuracy_to_half and self._attr_target_temperature is not None:
             """Round decimal accuracy of target temperature to .5"""
             self._attr_target_temperature = round_decimal_accuracy(
@@ -320,10 +369,30 @@ class ClimateGroup(GroupEntity, ClimateEntity):
         # so that we don't break in the future when a new feature is added.
         self._attr_supported_features &= SUPPORT_FLAGS
 
+        self._debounce_timer = None
+
+        #Only update Parent if child uptate is the latest
+        if self.last_changed < last_updated_time:
+            _LOGGER.debug(f"Kind ist am aktuellsten")
+            temp = self._attr_target_temperature
+            _LOGGER.debug(f"Current target temperature{temp}")
+            self.set_last_changed()
+            async def set_temperature(temp):
+                if isinstance(temp, float):
+                    await self.async_set_temperature(temperature=temp)
+            asyncio.create_task(set_temperature(temp))
+
         _LOGGER.debug("State update complete")
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Forward the turn_on command to all climate in the climate group."""
+        states = [
+            state
+            for entity_id in self._entity_ids
+            if (state := self.hass.states.get(entity_id)) is not None
+        ]
+
+        #Setzte initial, wird später ggf. überschriebenn
         data = {ATTR_ENTITY_ID: self._entity_ids}
 
         if ATTR_HVAC_MODE in kwargs:
@@ -331,17 +400,33 @@ class ClimateGroup(GroupEntity, ClimateEntity):
             await self.async_set_hvac_mode(kwargs[ATTR_HVAC_MODE])
 
         if ATTR_TEMPERATURE in kwargs:
-            data[ATTR_TEMPERATURE] = kwargs[ATTR_TEMPERATURE]
+            #Cut float (Sometimes ther are 2 numbers behind the colon)
+            temp = math.floor(kwargs[ATTR_TEMPERATURE] * 10) / 10
+            data[ATTR_TEMPERATURE] = temp
         if ATTR_TARGET_TEMP_LOW in kwargs:
             data[ATTR_TARGET_TEMP_LOW] = kwargs[ATTR_TARGET_TEMP_LOW]
         if ATTR_TARGET_TEMP_HIGH in kwargs:
             data[ATTR_TARGET_TEMP_HIGH] = kwargs[ATTR_TARGET_TEMP_HIGH]
+        #Wenn sich nur die Temp geändert hat, ändere nur die Notwendigen einträge
+        if not ATTR_TARGET_TEMP_LOW in kwargs and not ATTR_TARGET_TEMP_HIGH in kwargs:
+            entities = []
+            for entity in states:
+                if entity is not None and 'temperature' in entity.attributes:
+                    temp2 = reduce_attribute(
+                        [entity], ATTR_TEMPERATURE, reduce=lambda *data: mean(data)
+                    )
+                    temp2 = math.floor(temp2 * 10) / 10
+                    if temp2 != temp:
+                        entities.append(entity.entity_id)
+                    _LOGGER.debug(f"{entity.entity_id}, {temp2}, {temp}")
+            data[ATTR_ENTITY_ID] = entities
 
-        _LOGGER.debug("Setting temperature: %s", data)
-
-        await self.hass.services.async_call(
-            DOMAIN, SERVICE_SET_TEMPERATURE, data, blocking=True, context=self._context
-        )
+        if len(data[ATTR_ENTITY_ID]) > 0:
+            _LOGGER.debug("Setting temperature: %s", data)
+            self.set_last_changed()
+            await self.hass.services.async_call(DOMAIN, SERVICE_SET_TEMPERATURE, data, blocking=True, context=self._context)
+            _LOGGER.debug("Temperatur Änderung ------------------------------")
+            _LOGGER.debug(f"Data----: {data}")
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Forward the turn_on command to all climate in the climate group."""
